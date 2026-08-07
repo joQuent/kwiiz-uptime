@@ -1,0 +1,89 @@
+# Moniteur d'uptime EXTERNE de kwiiz.ch — tourne sur l'infra GitHub, donc
+# indépendant du VPS (il voit un VPS entièrement mort, ce que le check interne
+# de healthMonitor.js ne peut pas voir). Alerte via le bot Telegram existant.
+#
+# Anti-spam : l'état (ok/down + timestamp de la dernière alerte) est COMMITÉ
+# dans le fichier `state` → au plus 1 alerte Telegram par heure pendant une
+# panne, et un message unique de retour à la normale.
+#
+# ⚠️ Repo PUBLIC exprès : les minutes GitHub Actions y sont illimitées (sur le
+# repo privé kwiiz, ce cron brûlerait ~le quota mensuel et bloquerait les
+# déploiements). Aucun secret dans le code : token et chat_id sont des
+# GitHub Secrets chiffrés.
+#
+# ⚠️ GitHub coupe les crons après 60 jours sans commit → le workflow se
+# maintient seul (commit "keepalive" à J+45 de calme plat).
+name: Uptime Kwiiz
+
+on:
+  schedule:
+    - cron: '3-59/6 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uptime
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sonde des 3 domaines (3 essais espacés — pas d'alerte sur un blip)
+        id: probe
+        run: |
+          DOWN=""
+          for u in "https://kwiiz.ch/" "https://teacher.kwiiz.ch/api/library" "https://go.kwiiz.ch/"; do
+            ok=0
+            for try in 1 2 3; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$u" || echo 000)
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 10
+            done
+            [ "$ok" = "1" ] || DOWN="$DOWN $u"
+          done
+          echo "down=$DOWN" >> "$GITHUB_OUTPUT"
+
+      - name: Alerte Telegram / retour à la normale (état commité)
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOWN: ${{ steps.probe.outputs.down }}
+        run: |
+          NOW=$(date +%s)
+          STATE_STATUS=ok; STATE_TS=0
+          if [ -f state ]; then
+            STATE_STATUS=$(cut -d' ' -f1 state)
+            STATE_TS=$(cut -d' ' -f2 state)
+          fi
+          send() {
+            curl -sS -o /dev/null --max-time 15 \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$1"
+          }
+          commit_state() {
+            echo "$1 $NOW" > state
+            git config user.name kwiiz-uptime
+            git config user.email uptime@kwiiz.ch
+            git add state
+            git commit -m "$2" >/dev/null
+            git push >/dev/null
+          }
+          STAMP=$(TZ=Europe/Zurich date '+%d.%m.%Y · %HH%M')
+          if [ -n "$DOWN" ]; then
+            if [ "$STATE_STATUS" != "down" ] || [ $((NOW - STATE_TS)) -ge 3600 ]; then
+              send "🚨 UPTIME EXTERNE — injoignable depuis l'extérieur :$DOWN ($STAMP). Si le check interne n'a rien dit, le VPS est probablement mort → console Infomaniak."
+              commit_state down "alerte : site injoignable"
+            fi
+          else
+            if [ "$STATE_STATUS" = "down" ]; then
+              send "✅ UPTIME EXTERNE — tout répond de nouveau ($STAMP)"
+              commit_state ok "retour à la normale"
+            elif [ $((NOW - STATE_TS)) -ge 3888000 ]; then
+              commit_state ok "keepalive (les crons GitHub se coupent après 60 j sans commit)"
+            fi
+          fi
